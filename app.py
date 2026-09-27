@@ -3,71 +3,262 @@ import yfinance as yf
 import pandas as pd
 import numpy as np
 
-st.set_page_config(page_title="台股變化雷達", layout="wide")
+st.set_page_config(
+    page_title="台股變化雷達",
+    layout="wide"
+)
 
 st.title("📡 台股變化雷達")
-st.caption("找重跌、築底與開始出現變化的台股。缺資料就標示缺資料，不使用假數字代替。")
+st.caption(
+    "上市＋上櫃＋創新板｜重跌築底 × 量價變化 × 基本面轉折"
+)
 
 
 # =========================================================
-# 1. 取得上市＋上櫃股票清單
+# 基本工具
 # =========================================================
-@st.cache_data(ttl=86400)
-def get_tw_stock_list():
 
-    stock_list = []
+def clean_series(data):
 
-    for mode, suffix in [(2, ".TW"), (4, ".TWO")]:
+    if isinstance(data, pd.DataFrame):
+        if data.shape[1] == 0:
+            return pd.Series(dtype=float)
+        data = data.iloc[:, 0]
 
-        try:
-            url = f"https://isin.twse.com.tw/isin/C_public.jsp?strMode={mode}"
+    return pd.to_numeric(
+        data,
+        errors="coerce"
+    ).dropna()
 
-            df = pd.read_html(url)[0]
 
-            df.columns = df.iloc[0]
-            df = df.iloc[1:].copy()
+# =========================================================
+# 創新板公司辨識
+# =========================================================
 
-            column = "有價證券代號及名稱"
+@st.cache_data(
+    ttl=86400,
+    show_spinner=False
+)
+def get_innovation_codes():
 
-            for item in df[column].dropna().astype(str):
+    innovation_codes = set()
 
-                parts = item.split("\u3000")
+    try:
 
-                if len(parts) >= 2:
+        url = (
+            "https://www.twse.com.tw/"
+            "company/newlisting?"
+            "response=html"
+        )
 
-                    code = parts[0].strip()
-                    name = parts[1].strip()
+        tables = pd.read_html(url)
 
-                    # 只留四位數普通股票
-                    # 排除 00 開頭 ETF
+        for table in tables:
+
+            for _, row in table.iterrows():
+
+                row_text = " ".join(
+                    [
+                        str(x)
+                        for x in row.tolist()
+                    ]
+                )
+
+                if "創新板" in row_text:
+
+                    for value in row.tolist():
+
+                        value = str(
+                            value
+                        ).strip()
+
+                        if (
+                            len(value) == 4
+                            and
+                            value.isdigit()
+                        ):
+
+                            innovation_codes.add(
+                                value
+                            )
+
+                            break
+
+    except Exception:
+        pass
+
+
+    # 官方上市資料名稱若帶「創」
+    try:
+
+        api = (
+            "https://openapi.twse.com.tw/"
+            "v1/opendata/t187ap03_L"
+        )
+
+        df = pd.read_json(api)
+
+        if not df.empty:
+
+            code_columns = [
+                "公司代號",
+                "股票代號",
+                "證券代號"
+            ]
+
+            name_columns = [
+                "公司簡稱",
+                "公司名稱"
+            ]
+
+            code_col = None
+            name_col = None
+
+            for col in code_columns:
+
+                if col in df.columns:
+                    code_col = col
+                    break
+
+            for col in name_columns:
+
+                if col in df.columns:
+                    name_col = col
+                    break
+
+            if (
+                code_col is not None
+                and
+                name_col is not None
+            ):
+
+                for _, row in df.iterrows():
+
+                    code = str(
+                        row[code_col]
+                    ).strip()
+
+                    name = str(
+                        row[name_col]
+                    ).strip()
+
                     if (
+                        len(code) == 4
+                        and
                         code.isdigit()
-                        and len(code) == 4
-                        and not code.startswith("00")
+                        and
+                        (
+                            "-創" in name
+                            or
+                            "KY創" in name
+                            or
+                            "*-創" in name
+                        )
                     ):
 
-                        stock_list.append(
-                            {
-                                "code": code,
-                                "name": name,
-                                "symbol": code + suffix,
-                            }
+                        innovation_codes.add(
+                            code
                         )
 
-        except Exception:
-            pass
+    except Exception:
+        pass
 
-    return (
-        pd.DataFrame(stock_list)
-        .drop_duplicates("code")
-        .reset_index(drop=True)
+
+    return innovation_codes
+
+
+# =========================================================
+# 判斷上市 / 上櫃
+# =========================================================
+
+@st.cache_data(
+    ttl=86400,
+    show_spinner=False
+)
+def resolve_symbol(code):
+
+    innovation_codes = (
+        get_innovation_codes()
     )
 
 
+    # 先試上市
+    try:
+
+        symbol = (
+            code + ".TW"
+        )
+
+        df = yf.download(
+            symbol,
+            period="5d",
+            interval="1d",
+            auto_adjust=False,
+            progress=False,
+            threads=False,
+            timeout=8
+        )
+
+        if not df.empty:
+
+            if (
+                code
+                in innovation_codes
+            ):
+
+                return (
+                    symbol,
+                    "創新板"
+                )
+
+            return (
+                symbol,
+                "上市"
+            )
+
+    except Exception:
+        pass
+
+
+    # 再試上櫃
+    try:
+
+        symbol = (
+            code + ".TWO"
+        )
+
+        df = yf.download(
+            symbol,
+            period="5d",
+            interval="1d",
+            auto_adjust=False,
+            progress=False,
+            threads=False,
+            timeout=8
+        )
+
+        if not df.empty:
+
+            return (
+                symbol,
+                "上櫃"
+            )
+
+    except Exception:
+        pass
+
+
+    return None, None
+
+
 # =========================================================
-# 2. 股價資料
+# 股價
 # =========================================================
-@st.cache_data(ttl=3600)
+
+@st.cache_data(
+    ttl=3600,
+    show_spinner=False
+)
 def get_price(symbol):
 
     try:
@@ -79,15 +270,41 @@ def get_price(symbol):
             auto_adjust=False,
             progress=False,
             threads=False,
+            timeout=12
         )
 
         if df.empty:
             return pd.DataFrame()
 
-        if isinstance(df.columns, pd.MultiIndex):
-            df.columns = df.columns.get_level_values(0)
 
-        return df.dropna(how="all")
+        if isinstance(
+            df.columns,
+            pd.MultiIndex
+        ):
+
+            df.columns = (
+                df.columns
+                .get_level_values(0)
+            )
+
+
+        required = [
+            "Close",
+            "High",
+            "Low",
+            "Volume"
+        ]
+
+        for col in required:
+
+            if col not in df.columns:
+                return pd.DataFrame()
+
+
+        return df.dropna(
+            subset=["Close"]
+        )
+
 
     except Exception:
 
@@ -95,713 +312,1247 @@ def get_price(symbol):
 
 
 # =========================================================
-# 3. 技術面計算
+# 公司資料
 # =========================================================
-def technical_metrics(hist):
 
-    close = hist["Close"].dropna()
-    high = hist["High"].dropna()
-    volume = hist["Volume"].dropna()
+@st.cache_data(
+    ttl=86400,
+    show_spinner=False
+)
+def get_company_info(symbol):
 
-    current_price = float(close.iloc[-1])
-
-    two_year_high = float(high.max())
-
-    drawdown = (
-        (two_year_high - current_price)
-        / two_year_high
-        * 100
+    code = (
+        symbol
+        .split(".")[0]
     )
 
-    # MA60
-    if len(close) >= 60:
+    name = code
 
-        ma60 = float(
-            close.rolling(60).mean().iloc[-1]
+    market_cap = np.nan
+
+    capital = np.nan
+
+
+    try:
+
+        ticker = yf.Ticker(
+            symbol
         )
 
-        ma60_distance = (
-            current_price / ma60 - 1
-        ) * 100
+
+        try:
+
+            fast_info = (
+                ticker.fast_info
+            )
+
+            value = (
+                fast_info.get(
+                    "market_cap",
+                    None
+                )
+            )
+
+            if value:
+
+                market_cap = (
+                    float(value)
+                    / 1e8
+                )
+
+        except Exception:
+            pass
+
+
+        try:
+
+            info = (
+                ticker.get_info()
+            )
+
+            name = (
+                info.get(
+                    "shortName"
+                )
+                or
+                info.get(
+                    "longName"
+                )
+                or
+                code
+            )
+
+
+            shares = (
+                info.get(
+                    "sharesOutstanding"
+                )
+            )
+
+
+            if shares:
+
+                capital = (
+                    float(shares)
+                    * 10
+                    / 1e8
+                )
+
+        except Exception:
+            pass
+
+
+    except Exception:
+        pass
+
+
+    return (
+        name,
+        market_cap,
+        capital
+    )
+
+
+# =========================================================
+# 技術指標
+# =========================================================
+
+def calculate_metrics(
+    hist,
+    base_months
+):
+
+    close = clean_series(
+        hist["Close"]
+    )
+
+    high = clean_series(
+        hist["High"]
+    )
+
+    low = clean_series(
+        hist["Low"]
+    )
+
+    volume = clean_series(
+        hist["Volume"]
+    )
+
+
+    if (
+        close.empty
+        or
+        high.empty
+        or
+        low.empty
+    ):
+
+        return None
+
+
+    current_price = float(
+        close.iloc[-1]
+    )
+
+
+    highest_price = float(
+        high.max()
+    )
+
+
+    if highest_price > 0:
+
+        drawdown = (
+            (
+                highest_price
+                - current_price
+            )
+            / highest_price
+            * 100
+        )
+
+    else:
+
+        drawdown = np.nan
+
+
+    # ==========================================
+    # MA60
+    # ==========================================
+
+    if len(close) >= 60:
+
+        ma60 = (
+            close
+            .rolling(60)
+            .mean()
+            .iloc[-1]
+        )
+
+        if (
+            pd.notna(ma60)
+            and
+            ma60 != 0
+        ):
+
+            ma60_distance = (
+                (
+                    current_price
+                    / ma60
+                )
+                - 1
+            ) * 100
+
+        else:
+
+            ma60_distance = np.nan
 
     else:
 
         ma60_distance = np.nan
 
-    # 20日量 vs 60日量
+
+    # ==========================================
+    # 週MA20
+    # ==========================================
+
+    weekly = (
+        close
+        .resample("W")
+        .last()
+    )
+
+    if len(weekly) >= 20:
+
+        weekly_ma20 = (
+            weekly
+            .rolling(20)
+            .mean()
+            .iloc[-1]
+        )
+
+        weekly_ma20_distance = (
+            (
+                current_price
+                / weekly_ma20
+            )
+            - 1
+        ) * 100
+
+    else:
+
+        weekly_ma20_distance = np.nan
+
+
+    # ==========================================
+    # 月MA20
+    # ==========================================
+
+    monthly = (
+        close
+        .resample("ME")
+        .last()
+    )
+
+    if len(monthly) >= 20:
+
+        monthly_ma20 = (
+            monthly
+            .rolling(20)
+            .mean()
+            .iloc[-1]
+        )
+
+        monthly_ma20_distance = (
+            (
+                current_price
+                / monthly_ma20
+            )
+            - 1
+        ) * 100
+
+    else:
+
+        monthly_ma20_distance = np.nan
+
+
+    # ==========================================
+    # 量能
+    # ==========================================
+
     if len(volume) >= 60:
 
-        volume20 = float(
-            volume.tail(20).mean()
+        volume20 = (
+            volume
+            .tail(20)
+            .mean()
         )
 
-        volume60 = float(
-            volume.tail(60).mean()
+        volume60 = (
+            volume
+            .tail(60)
+            .mean()
         )
 
-        volume_change = (
-            volume20 / volume60 - 1
-        ) * 100
+        if volume60 != 0:
+
+            volume_change = (
+                (
+                    volume20
+                    / volume60
+                )
+                - 1
+            ) * 100
+
+        else:
+
+            volume_change = np.nan
 
     else:
 
         volume_change = np.nan
 
-    return (
-        current_price,
-        drawdown,
-        ma60_distance,
-        volume_change,
+
+    # ==========================================
+    # 築底
+    # ==========================================
+
+    days = min(
+        len(hist),
+        max(
+            42,
+            int(
+                base_months
+                * 21
+            )
+        )
     )
 
 
+    recent = (
+        hist
+        .tail(days)
+    )
+
+
+    recent_high = float(
+        clean_series(
+            recent["High"]
+        ).max()
+    )
+
+    recent_low = float(
+        clean_series(
+            recent["Low"]
+        ).min()
+    )
+
+
+    if recent_low > 0:
+
+        base_range = (
+            (
+                recent_high
+                - recent_low
+            )
+            / recent_low
+            * 100
+        )
+
+    else:
+
+        base_range = np.nan
+
+
+    # ==========================================
+    # 防止把急跌當築底
+    # ==========================================
+
+    change20 = 0.0
+
+
+    if len(close) >= 20:
+
+        old_price = float(
+            close.iloc[-20]
+        )
+
+        if old_price != 0:
+
+            change20 = (
+                (
+                    current_price
+                    / old_price
+                )
+                - 1
+            ) * 100
+
+
+    return {
+        "price":
+            current_price,
+
+        "drawdown":
+            drawdown,
+
+        "ma60":
+            ma60_distance,
+
+        "weekly_ma20":
+            weekly_ma20_distance,
+
+        "monthly_ma20":
+            monthly_ma20_distance,
+
+        "volume":
+            volume_change,
+
+        "base_range":
+            base_range,
+
+        "change20":
+            change20
+    }
+
+
 # =========================================================
-# 4. 股票池
+# 側邊欄
 # =========================================================
-try:
 
-    stock_df = get_tw_stock_list()
-
-except Exception as e:
-
-    st.error(f"股票清單讀取失敗：{e}")
-
-    st.stop()
-
-
-# =========================================================
-# 5. 側邊欄
-# =========================================================
 with st.sidebar:
 
-    st.header("⚙️ 糖球預設策略")
-
-    st.caption(
-        "預設值已直接設定好，平常不用每次重新調整。"
+    st.header(
+        "⚙️ 糖球預設策略"
     )
 
-    drawdown_threshold = st.selectbox(
-        "高點回落 (%)",
-        [30, 40, 50, 60, 70],
-        index=2,
+
+    drawdown_threshold = (
+        st.selectbox(
+            "高點回落 (%)",
+            [
+                30,
+                40,
+                50,
+                60,
+                70
+            ],
+            index=2
+        )
     )
 
-    base_months = st.selectbox(
-        "築底觀察期（月）",
-        [2, 3, 6, 12, 18, 24],
-        index=2,
+
+    base_months = (
+        st.selectbox(
+            "築底觀察期（月）",
+            [
+                2,
+                3,
+                6,
+                12,
+                18,
+                24
+            ],
+            index=2
+        )
     )
 
-    contraction_pct = st.slider(
-        "築底區間最大波動 (%)",
-        10,
-        50,
-        20,
-        5,
+
+    contraction_pct = (
+        st.slider(
+            "築底區間最大波動 (%)",
+            10,
+            60,
+            20,
+            5
+        )
     )
 
-    volume_threshold = st.slider(
-        "底部量能增加 (%)",
-        0,
-        100,
-        30,
-        5,
+
+    volume_threshold = (
+        st.slider(
+            "底部量能增加 (%)",
+            0,
+            100,
+            30,
+            5
+        )
     )
 
-    max_market_cap = st.number_input(
-        "市值上限（億元）",
-        min_value=0.0,
-        max_value=100000.0,
-        value=500.0,
-        step=50.0,
+
+    max_market_cap = (
+        st.number_input(
+            "市值上限（億元）",
+            value=500.0,
+            step=50.0
+        )
     )
 
-    st.divider()
 
-    st.write("必要：高點回落＋築底")
-
-    st.write(
-        "加分：市值、MA60、底部放量"
+    max_capital = (
+        st.number_input(
+            "股本上限（億元）",
+            value=50.0,
+            step=10.0
+        )
     )
 
-    st.caption(
-        "CAPEX、合約負債、CB、營收、籌碼等尚未接到真實資料前，不使用假數字代替。"
+
+    market_filter = (
+        st.multiselect(
+            "市場",
+            [
+                "上市",
+                "上櫃",
+                "創新板"
+            ],
+            default=[
+                "上市",
+                "上櫃",
+                "創新板"
+            ]
+        )
     )
 
 
 # =========================================================
-# 6. 主頁
+# 分頁
 # =========================================================
+
 tab1, tab2, tab3 = st.tabs(
     [
-        "🔎 全市場雷達",
+        "🔎 雷達掃描",
         "📊 個股檢查",
-        "🧭 完整雷達項目",
+        "🧭 32項雷達"
     ]
 )
 
 
 # =========================================================
-# 全市場雷達
+# 雷達掃描
 # =========================================================
+
 with tab1:
 
-    st.subheader("全台股掃描")
-
-    st.write(
-        f"目前股票池：{len(stock_df)} 檔"
+    st.subheader(
+        "上市＋上櫃＋創新板雷達"
     )
 
-    scan_options = [
-        50,
-        100,
-        200,
-        500,
-        len(stock_df),
-    ]
 
-    scan_options = sorted(
-        list(set(scan_options))
+    col1, col2 = (
+        st.columns(2)
     )
 
-    scan_limit = st.selectbox(
-        "這次掃描數量",
-        scan_options,
-        index=min(
-            1,
-            len(scan_options) - 1
-        ),
-    )
+
+    with col1:
+
+        start_code = (
+            st.number_input(
+                "起始股票代號",
+                min_value=1101,
+                max_value=9999,
+                value=1101,
+                step=100
+            )
+        )
+
+
+    with col2:
+
+        scan_count = (
+            st.selectbox(
+                "這次掃描數量",
+                [
+                    20,
+                    50,
+                    100,
+                    200,
+                    500
+                ],
+                index=1
+            )
+        )
+
 
     if st.button(
         "🚀 開始掃描",
-        type="primary",
+        type="primary"
     ):
 
-        targets = stock_df.head(
-            scan_limit
+        start = int(
+            start_code
         )
 
-        progress_bar = st.progress(0)
+        end = min(
+            10000,
+            start
+            + int(scan_count)
+        )
+
+
+        codes = [
+            str(code)
+            for code
+            in range(
+                start,
+                end
+            )
+        ]
+
+
+        progress = (
+            st.progress(0)
+        )
+
+        status = (
+            st.empty()
+        )
 
         results = []
 
-        total = len(targets)
+        valid_stocks = 0
 
-        for i, (_, stock) in enumerate(
-            targets.iterrows()
+
+        for index, code in enumerate(
+            codes
         ):
 
-            hist = get_price(
-                stock["symbol"]
+            status.write(
+                f"正在檢查 {code}..."
             )
 
-            if len(hist) >= 60:
 
-                (
-                    price,
-                    drawdown,
-                    ma60_distance,
-                    volume_change,
-                ) = technical_metrics(hist)
+            symbol, market = (
+                resolve_symbol(
+                    code
+                )
+            )
 
-                # -------------------------
-                # 築底區間
-                # -------------------------
-                days = min(
-                    len(hist),
-                    int(base_months * 21),
+
+            if (
+                symbol
+                and
+                market
+                in market_filter
+            ):
+
+                hist = (
+                    get_price(
+                        symbol
+                    )
                 )
 
-                recent = hist.tail(days)
 
-                recent_high = float(
-                    recent["High"].max()
-                )
+                if len(hist) >= 60:
 
-                recent_low = float(
-                    recent["Low"].min()
-                )
+                    valid_stocks += 1
 
-                if recent_low > 0:
 
-                    base_range = (
-                        (
-                            recent_high
-                            - recent_low
+                    data = (
+                        calculate_metrics(
+                            hist,
+                            base_months
                         )
-                        / recent_low
-                        * 100
                     )
 
-                else:
 
-                    base_range = np.nan
+                    if data is None:
 
-                # -------------------------
-                # 避免一路下跌被誤判築底
-                # -------------------------
-                close = hist[
-                    "Close"
-                ].dropna()
-
-                if len(close) >= 20:
-
-                    recent20_change = (
-                        float(close.iloc[-1])
-                        / float(close.iloc[-20])
-                        - 1
-                    ) * 100
-
-                else:
-
-                    recent20_change = 0
-
-                base_ok = (
-                    pd.notna(base_range)
-                    and base_range
-                    <= contraction_pct
-                    and recent20_change
-                    > -15
-                )
-
-                drawdown_ok = (
-                    drawdown
-                    >= drawdown_threshold
-                )
-
-                # -------------------------
-                # 市值
-                # 抓不到就空白
-                # 不亂填
-                # -------------------------
-                market_cap = np.nan
-
-                try:
-
-                    ticker = yf.Ticker(
-                        stock["symbol"]
-                    )
-
-                    fast_info = (
-                        ticker.fast_info
-                    )
-
-                    value = fast_info.get(
-                        "market_cap",
-                        None,
-                    )
-
-                    if value:
-
-                        market_cap = (
-                            float(value)
-                            / 100000000
+                        progress.progress(
+                            (
+                                index + 1
+                            )
+                            / len(codes)
                         )
 
-                except Exception:
+                        continue
 
-                    pass
 
-                score = 0
-
-                reasons = []
-
-                if drawdown_ok:
-
-                    reasons.append(
-                        f"2年高點回落 {drawdown:.1f}%"
+                    (
+                        company_name,
+                        market_cap,
+                        capital
+                    ) = (
+                        get_company_info(
+                            symbol
+                        )
                     )
 
-                if base_ok:
 
-                    reasons.append(
-                        f"近{base_months}月波動區間 {base_range:.1f}%"
+                    drawdown_ok = (
+                        pd.notna(
+                            data[
+                                "drawdown"
+                            ]
+                        )
+                        and
+                        data[
+                            "drawdown"
+                        ]
+                        >=
+                        drawdown_threshold
                     )
 
-                # MA60 加分
-                if (
-                    pd.notna(
-                        ma60_distance
-                    )
-                    and abs(
-                        ma60_distance
-                    )
-                    <= 10
-                ):
 
-                    score += 15
-
-                    reasons.append(
-                        f"距MA60 {ma60_distance:+.1f}%"
-                    )
-
-                # 底部放量
-                if (
-                    pd.notna(
-                        volume_change
-                    )
-                    and volume_change
-                    >= volume_threshold
-                ):
-
-                    score += 20
-
-                    reasons.append(
-                        f"近20日量較60日均量 {volume_change:+.1f}%"
+                    base_ok = (
+                        pd.notna(
+                            data[
+                                "base_range"
+                            ]
+                        )
+                        and
+                        data[
+                            "base_range"
+                        ]
+                        <=
+                        contraction_pct
+                        and
+                        data[
+                            "change20"
+                        ]
+                        >
+                        -15
                     )
 
-                # 中小市值
-                if (
-                    pd.notna(
+
+                    score = 0
+
+                    reasons = []
+
+
+                    if drawdown_ok:
+
+                        reasons.append(
+                            "2年高點回落 "
+                            f"{data['drawdown']:.1f}%"
+                        )
+
+
+                    if base_ok:
+
+                        reasons.append(
+                            f"{base_months}月"
+                            "築底區間 "
+                            f"{data['base_range']:.1f}%"
+                        )
+
+
+                    if (
+                        pd.notna(
+                            data["ma60"]
+                        )
+                        and
+                        abs(
+                            data["ma60"]
+                        )
+                        <= 10
+                    ):
+
+                        score += 15
+
+                        reasons.append(
+                            "距MA60 "
+                            f"{data['ma60']:+.1f}%"
+                        )
+
+
+                    if (
+                        pd.notna(
+                            data["volume"]
+                        )
+                        and
+                        data["volume"]
+                        >=
+                        volume_threshold
+                    ):
+
+                        score += 20
+
+                        reasons.append(
+                            "量能增加 "
+                            f"{data['volume']:+.1f}%"
+                        )
+
+
+                    if (
+                        pd.notna(
+                            market_cap
+                        )
+                        and
                         market_cap
-                    )
-                    and market_cap
-                    <= max_market_cap
-                ):
+                        <=
+                        max_market_cap
+                    ):
 
-                    score += 10
+                        score += 10
 
-                    reasons.append(
-                        f"市值約 {market_cap:.1f} 億"
-                    )
+                        reasons.append(
+                            "市值 "
+                            f"{market_cap:.1f}億"
+                        )
 
-                # -------------------------
-                # 必要條件
-                # -------------------------
-                if (
-                    drawdown_ok
-                    and base_ok
-                ):
 
-                    results.append(
-                        {
-                            "代號":
-                                stock["code"],
+                    if (
+                        pd.notna(
+                            capital
+                        )
+                        and
+                        capital
+                        <=
+                        max_capital
+                    ):
 
-                            "名稱":
-                                stock["name"],
+                        score += 10
 
-                            "現價":
-                                round(
-                                    price,
-                                    2,
-                                ),
+                        reasons.append(
+                            "股本約 "
+                            f"{capital:.1f}億"
+                        )
 
-                            "2年高點回落":
-                                f"{drawdown:.1f}%",
 
-                            "築底區間":
-                                f"{base_range:.1f}%",
+                    if (
+                        drawdown_ok
+                        and
+                        base_ok
+                    ):
 
-                            "MA60距離":
-                                (
-                                    ""
-                                    if pd.isna(
-                                        ma60_distance
-                                    )
-                                    else
-                                    f"{ma60_distance:+.1f}%"
-                                ),
+                        results.append(
+                            {
+                                "代號":
+                                    code,
 
-                            "量能變化":
-                                (
-                                    ""
-                                    if pd.isna(
-                                        volume_change
-                                    )
-                                    else
-                                    f"{volume_change:+.1f}%"
-                                ),
+                                "名稱":
+                                    company_name,
 
-                            "市值(億)":
-                                (
-                                    ""
-                                    if pd.isna(
-                                        market_cap
-                                    )
-                                    else
+                                "市場":
+                                    market,
+
+                                "現價":
                                     round(
-                                        market_cap,
-                                        1,
+                                        data[
+                                            "price"
+                                        ],
+                                        2
+                                    ),
+
+                                "2年高點回落":
+                                    f"{data['drawdown']:.1f}%",
+
+                                "築底區間":
+                                    f"{data['base_range']:.1f}%",
+
+                                "MA60":
+                                    (
+                                        ""
+                                        if
+                                        pd.isna(
+                                            data[
+                                                "ma60"
+                                            ]
+                                        )
+                                        else
+                                        f"{data['ma60']:+.1f}%"
+                                    ),
+
+                                "週MA20":
+                                    (
+                                        ""
+                                        if
+                                        pd.isna(
+                                            data[
+                                                "weekly_ma20"
+                                            ]
+                                        )
+                                        else
+                                        f"{data['weekly_ma20']:+.1f}%"
+                                    ),
+
+                                "月MA20":
+                                    (
+                                        ""
+                                        if
+                                        pd.isna(
+                                            data[
+                                                "monthly_ma20"
+                                            ]
+                                        )
+                                        else
+                                        f"{data['monthly_ma20']:+.1f}%"
+                                    ),
+
+                                "量能":
+                                    (
+                                        ""
+                                        if
+                                        pd.isna(
+                                            data[
+                                                "volume"
+                                            ]
+                                        )
+                                        else
+                                        f"{data['volume']:+.1f}%"
+                                    ),
+
+                                "市值(億)":
+                                    (
+                                        ""
+                                        if
+                                        pd.isna(
+                                            market_cap
+                                        )
+                                        else
+                                        round(
+                                            market_cap,
+                                            1
+                                        )
+                                    ),
+
+                                "股本估算(億)":
+                                    (
+                                        ""
+                                        if
+                                        pd.isna(
+                                            capital
+                                        )
+                                        else
+                                        round(
+                                            capital,
+                                            1
+                                        )
+                                    ),
+
+                                "加分":
+                                    score,
+
+                                "為什麼抓到":
+                                    " → ".join(
+                                        reasons
                                     )
-                                ),
+                            }
+                        )
 
-                            "技術加分":
-                                score,
 
-                            "為什麼抓到":
-                                " → ".join(
-                                    reasons
-                                ),
-                        }
-                    )
-
-            progress_bar.progress(
-                (i + 1) / total
+            progress.progress(
+                (
+                    index + 1
+                )
+                / len(codes)
             )
+
+
+        status.empty()
+
+
+        st.write(
+            "本次檢查 "
+            f"{len(codes)} 個代號，"
+            f"{valid_stocks} 個"
+            "有有效行情。"
+        )
+
 
         if results:
 
-            result_df = pd.DataFrame(
-                results
-            )
-
             result_df = (
-                result_df.sort_values(
-                    by="技術加分",
-                    ascending=False,
+                pd.DataFrame(
+                    results
+                )
+                .sort_values(
+                    "加分",
+                    ascending=False
                 )
             )
 
+
             st.success(
-                f"找到 {len(result_df)} 檔符合目前必要條件"
+                "找到 "
+                f"{len(result_df)} 檔"
+                "符合必要條件"
             )
+
 
             st.dataframe(
                 result_df,
                 use_container_width=True,
-                hide_index=True,
+                hide_index=True
             )
+
 
         else:
 
             st.warning(
-                "目前掃描範圍沒有符合必要條件的股票。"
+                "目前這個區段沒有符合"
+                "「重跌＋築底」"
+                "必要條件的股票。"
             )
 
 
 # =========================================================
-# 7. 個股檢查
+# 個股檢查
 # =========================================================
+
 with tab2:
 
-    st.subheader("個股檢查")
-
-    stock_code = st.text_input(
-        "輸入股票代號，例如 2330"
+    st.subheader(
+        "個股完整檢查"
     )
 
-    if stock_code:
 
-        hit = stock_df[
-            stock_df["code"]
-            == stock_code.strip()
-        ]
+    stock_code = (
+        st.text_input(
+            "輸入4位股票代號"
+        )
+    )
 
-        if hit.empty:
 
-            st.warning(
-                "找不到這個股票代號"
+    if st.button(
+        "查這一檔"
+    ):
+
+        stock_code = (
+            stock_code
+            .strip()
+        )
+
+
+        if not (
+            len(stock_code)
+            == 4
+            and
+            stock_code.isdigit()
+        ):
+
+            st.error(
+                "請輸入4位數股票代號"
             )
 
         else:
 
-            stock = hit.iloc[0]
-
-            hist = get_price(
-                stock["symbol"]
+            symbol, market = (
+                resolve_symbol(
+                    stock_code
+                )
             )
 
-            st.subheader(
-                f"{stock['code']} {stock['name']}"
-            )
 
-            if hist.empty:
+            if not symbol:
 
                 st.error(
-                    "目前抓不到股價資料"
+                    "找不到這個股票代號"
                 )
 
             else:
 
+                hist = (
+                    get_price(
+                        symbol
+                    )
+                )
+
+
                 (
-                    price,
-                    drawdown,
-                    ma60_distance,
-                    volume_change,
-                ) = technical_metrics(
-                    hist
+                    company_name,
+                    market_cap,
+                    capital
+                ) = (
+                    get_company_info(
+                        symbol
+                    )
                 )
 
-                col1, col2, col3, col4 = (
-                    st.columns(4)
+
+                st.subheader(
+                    f"{stock_code} "
+                    f"{company_name}｜"
+                    f"{market}"
                 )
 
-                col1.metric(
-                    "現價",
-                    f"{price:.2f}",
-                )
 
-                col2.metric(
-                    "2年高點回落",
-                    f"{drawdown:.1f}%",
-                )
+                if hist.empty:
 
-                col3.metric(
-                    "距 MA60",
-                    (
-                        "缺資料"
-                        if pd.isna(
-                            ma60_distance
+                    st.error(
+                        "抓不到股價資料"
+                    )
+
+                else:
+
+                    data = (
+                        calculate_metrics(
+                            hist,
+                            base_months
                         )
-                        else
-                        f"{ma60_distance:+.1f}%"
-                    ),
-                )
+                    )
 
-                col4.metric(
-                    "量能變化",
-                    (
-                        "缺資料"
-                        if pd.isna(
-                            volume_change
+
+                    if data:
+
+                        c1, c2, c3, c4 = (
+                            st.columns(4)
                         )
-                        else
-                        f"{volume_change:+.1f}%"
-                    ),
-                )
 
-                st.line_chart(
-                    hist["Close"]
-                )
 
-            # -------------------------
-            # 真實功能狀態
-            # -------------------------
-            st.subheader(
-                "資料模組狀態"
-            )
+                        c1.metric(
+                            "現價",
+                            f"{data['price']:.2f}"
+                        )
 
-            status_df = pd.DataFrame(
-                [
-                    [
-                        "股價／跌幅／均線／量能",
-                        "已接",
-                    ],
-                    [
-                        "上市櫃股票池",
-                        "已接",
-                    ],
-                    [
-                        "股本／正式市值來源",
-                        "待接官方資料",
-                    ],
-                    [
-                        "月營收 YoY／MoM／累計",
-                        "待接官方資料",
-                    ],
-                    [
-                        "財報／毛利／EPS／現金流／存貨／應收",
-                        "待接官方資料",
-                    ],
-                    [
-                        "CAPEX",
-                        "待接財報資料，不以營收成長冒充",
-                    ],
-                    [
-                        "合約負債",
-                        "待接財報資料",
-                    ],
-                    [
-                        "CB 可轉債",
-                        "待接公開資訊",
-                    ],
-                    [
-                        "外資／投信／自營商／融資融券",
-                        "待接官方資料",
-                    ],
-                    [
-                        "公告／法說／合作／擴產／客戶",
-                        "待接公開資訊",
-                    ],
-                    [
-                        "群體性／族群輪動／歷史循環",
-                        "待資料完成後運算",
-                    ],
-                ],
-                columns=[
-                    "項目",
-                    "狀態",
-                ],
-            )
 
-            st.dataframe(
-                status_df,
-                use_container_width=True,
-                hide_index=True,
-            )
+                        c2.metric(
+                            "2年高點回落",
+                            f"{data['drawdown']:.1f}%"
+                        )
+
+
+                        c3.metric(
+                            "距MA60",
+                            (
+                                "缺資料"
+                                if
+                                pd.isna(
+                                    data["ma60"]
+                                )
+                                else
+                                f"{data['ma60']:+.1f}%"
+                            )
+                        )
+
+
+                        c4.metric(
+                            "量能變化",
+                            (
+                                "缺資料"
+                                if
+                                pd.isna(
+                                    data[
+                                        "volume"
+                                    ]
+                                )
+                                else
+                                f"{data['volume']:+.1f}%"
+                            )
+                        )
+
+
+                        st.line_chart(
+                            hist["Close"]
+                        )
+
+
+                        st.write(
+                            "市場：",
+                            market
+                        )
+
+
+                        st.write(
+                            "築底區間：",
+                            f"{data['base_range']:.1f}%"
+                        )
+
+
+                        st.write(
+                            "週MA20距離：",
+                            (
+                                "缺資料"
+                                if
+                                pd.isna(
+                                    data[
+                                        "weekly_ma20"
+                                    ]
+                                )
+                                else
+                                f"{data['weekly_ma20']:+.1f}%"
+                            )
+                        )
+
+
+                        st.write(
+                            "月MA20距離：",
+                            (
+                                "缺資料"
+                                if
+                                pd.isna(
+                                    data[
+                                        "monthly_ma20"
+                                    ]
+                                )
+                                else
+                                f"{data['monthly_ma20']:+.1f}%"
+                            )
+                        )
+
+
+                        st.write(
+                            "市值：",
+                            (
+                                "缺資料"
+                                if
+                                pd.isna(
+                                    market_cap
+                                )
+                                else
+                                f"{market_cap:.1f}億"
+                            )
+                        )
+
+
+                        st.write(
+                            "股本：",
+                            (
+                                "缺資料"
+                                if
+                                pd.isna(
+                                    capital
+                                )
+                                else
+                                f"約{capital:.1f}億"
+                            )
+                        )
 
 
 # =========================================================
-# 8. 32項正式雷達範圍
+# 32項雷達
 # =========================================================
+
 with tab3:
 
     st.subheader(
-        "正式版雷達功能範圍"
+        "32項正式雷達"
     )
+
 
     st.markdown(
         """
-### 技術與規模
-上市＋上櫃股票池、股本、市值、2年高點回落、築底時間、波動收斂、MA60、週MA20、月MA20、底部放量。
-
-### 營收與基本面
-月營收 YoY、MoM、累計營收、連續成長、由負轉正、成長加速、毛利率、營業利益、EPS、現金流、存貨、應收帳款。
-
-### CAPEX
-CAPEX 年增率、CAPEX／股本、CAPEX／股東權益、CAPEX／營收。
-
-### 合約負債
-季增、連續增加、突然增加，以及後續是否轉成營收。
-
-### CB 可轉債
-發行日期、規模、轉換價、轉換期間、價格調整、轉換狀態與股價時間軸。
-
-### 公司事件
-擴產、新廠、新產線、設備、認證、新產品、新市場、新客戶、轉虧為盈、併購、投資與處分。
-
-### 合作與供應鏈
-公司合作、策略聯盟、共同開發、供貨、採購、訂單、客戶、上下游與供應鏈關係。
-
-### 題材
-AI、機器人、半導體、PCB、散熱、伺服器、軍工、生技等，可多標籤。
-
-### 群體性
-同產業、同題材、上下游公司是否同時出現營收、量價、法人、CAPEX 等變化。
-
-### 族群輪動
-找原本安靜、後來整群開始出現變化的族群，並保存歷史。
-
-### 歷史循環
-多年股價、營收、季節性、產業循環與量價規律。
-
-### 籌碼
-外資、投信、自營商、融資融券及可取得的大戶持股資料。
-
-### 公告與新聞
-重大訊息、公告、法說、新聞，保留日期、來源與原文。
-
-### AI整理
-把財報、公告與法說整理成白話，同時找正面證據與反證，不自行猜測缺失資料。
-
-### 個股完整頁
-技術面、基本面、CAPEX、合約負債、CB、事件、合作、供應鏈、題材、群體性、籌碼、循環與新聞時間軸。
-
-### 全市場雷達
-掃描全台上市櫃股票，找近期新出現的變化。
-
-### 自選股與提醒
-保存自選股，追蹤營收、公告、CB、合作、籌碼與群體變化。
-
-### 原始資料追蹤
-所有重要數字與判斷保留來源、資料日期與抓取時間。
-
----
-
-雷達負責找出異常、轉折、群體、輪動、循環與事件。
-
-每一檔被抓出的股票都必須說明「為什麼被抓到」，不能只顯示一個分數。
+1. 上市＋上櫃＋創新板，排除ETF  
+2. 股本、市值篩選  
+3. 2年高點回落  
+4. 築底時間  
+5. 波動收斂  
+6. MA60／週MA20／月MA20  
+7. 底部放量  
+8. 月營收 YoY／MoM／累計  
+9. 財報轉折  
+10. CAPEX  
+11. 合約負債  
+12. CB可轉債  
+13. 擴產與公司事件  
+14. 公司合作  
+15. 客戶與供應鏈  
+16. 題材分類  
+17. 群體性  
+18. 族群輪動  
+19. 歷史循環  
+20. 籌碼變化  
+21. 公告／重大訊息／法說／新聞  
+22. 事件與股價時間軸  
+23. AI白話整理  
+24. AI反證  
+25. 個股完整頁  
+26. 全市場雷達  
+27. Must／Bonus／Off  
+28. 自選股  
+29. 異常提醒  
+30. 顯示「為什麼抓到」  
+31. 資料來源／日期／抓取時間  
+32. 雷達只找變化，不替使用者決定買賣
 """
     )
