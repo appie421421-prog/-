@@ -1,531 +1,606 @@
-import streamlit as st
-import yfinance as yf
-import pandas as pd
-import numpy as np
+import re
 from datetime import datetime
 
-st.set_page_config(page_title="台股轉機雷達", layout="wide")
-st.title("📡 台股轉機雷達")
-st.caption("多邏輯選股：關閉＝不參與｜加分＝有就加分｜必要＝不符合就排除")
+import numpy as np
+import pandas as pd
+import requests
+import streamlit as st
+import yfinance as yf
+
+st.set_page_config(page_title="台股變化雷達", page_icon="📡", layout="wide")
+st.title("📡 台股變化雷達")
+st.caption("關閉＝完全不參與｜加分＝符合才加分、不淘汰｜必要＝不符合才淘汰｜數值 0＝不限制")
 
 MODES = ["關閉", "加分", "必要"]
-
-
-def mode(label, key, default="關閉"):
-    return st.selectbox(
-        label,
-        MODES,
-        index=MODES.index(default),
-        key=key
-    )
+HEADERS = {"User-Agent": "Mozilla/5.0", "Accept": "application/json,text/plain,text/html,*/*"}
+TWSE_BASIC = "https://openapi.twse.com.tw/v1/opendata/t187ap03_L"
+TPEX_BASIC = "https://www.tpex.org.tw/openapi/v1/mopsfin_t187ap03_O"
+TWSE_NEWLIST = "https://www.twse.com.tw/rwd/zh/company/applylisting?response=html"
+MOPS_CB = "https://mops.twse.com.tw/mops/web/t120sb02_q10"
+TPEX_CB = "https://www.tpex.org.tw/zh-tw/bond/issue/cbond/listed.html"
 
 
 def num(v):
     try:
-        return float(v)
-    except:
+        return float(str(v).replace(",", "").replace("%", "").strip())
+    except Exception:
         return np.nan
 
 
-def series(x):
-    if isinstance(x, pd.DataFrame):
-        if x.shape[1] == 0:
-            return pd.Series(dtype=float)
-        x = x.iloc[:, 0]
-
-    return pd.to_numeric(
-        x,
-        errors="coerce"
-    ).dropna()
+def fetch_json(url):
+    try:
+        r = requests.get(url, headers=HEADERS, timeout=20)
+        r.raise_for_status()
+        return r.json()
+    except Exception:
+        return None
 
 
-# =========================================================
-# 自動判斷上市 / 上櫃
-# =========================================================
+def fetch_text(url):
+    try:
+        r = requests.get(url, headers=HEADERS, timeout=20)
+        r.raise_for_status()
+        return r.text
+    except Exception:
+        return ""
 
-@st.cache_data(ttl=86400, show_spinner=False)
-def resolve_symbol(code):
 
-    for suffix, market in [
-        (".TW", "上市"),
-        (".TWO", "上櫃")
-    ]:
+@st.cache_data(ttl=21600, show_spinner=False)
+def innovation_codes():
+    """以證交所『最近上市公司』官方頁的備註/名稱辨識創新板。"""
+    codes = set()
+    try:
+        tables = pd.read_html(TWSE_NEWLIST)
+        for df in tables:
+            for _, row in df.iterrows():
+                text = " ".join(str(x) for x in row.values)
+                if "創新板" in text or re.search(r"(?:-創|KY創)\b", text):
+                    m = re.search(r"(?<!\d)(\d{4})(?!\d)", text)
+                    if m:
+                        codes.add(m.group(1))
+    except Exception:
+        pass
+    return codes
 
-        try:
 
-            df = yf.download(
-                code + suffix,
-                period="5d",
-                progress=False,
-                auto_adjust=False,
-                threads=False,
-                timeout=8
+@st.cache_data(ttl=21600, show_spinner=False)
+def stock_pool():
+    rows, seen = [], set()
+    innov = innovation_codes()
+
+    twse = fetch_json(TWSE_BASIC) or []
+    for x in twse:
+        code = str(x.get("公司代號", x.get("Code", ""))).strip()
+        if len(code) != 4 or not code.isdigit() or code.startswith("00"):
+            continue
+
+        name = str(x.get("公司簡稱", x.get("公司名稱", x.get("Name", "")))).strip()
+        cap = num(x.get("實收資本額", x.get("Paidin.Capital.NTDollars", np.nan)))
+        market = "創新板" if code in innov or "-創" in name or "KY創" in name else "上市"
+
+        rows.append({
+            "代號": code,
+            "名稱": name,
+            "市場": market,
+            "產業": str(x.get("產業別", x.get("產業類別", ""))).strip(),
+            "股本億": cap / 1e8 if pd.notna(cap) else np.nan,
+            "symbol": code + ".TW",
+        })
+
+        seen.add(code)
+
+    tpex = fetch_json(TPEX_BASIC) or []
+
+    for x in tpex:
+        code = str(x.get("SecuritiesCompanyCode", x.get("公司代號", ""))).strip()
+
+        if len(code) != 4 or not code.isdigit() or code.startswith("00") or code in seen:
+            continue
+
+        name = str(
+            x.get(
+                "CompanyAbbreviation",
+                x.get("CompanyName", x.get("公司簡稱", ""))
             )
+        ).strip()
 
-            if not df.empty:
-                return code + suffix, market
+        cap = num(
+            x.get(
+                "Paidin.Capital.NTDollars",
+                x.get("實收資本額", np.nan)
+            )
+        )
 
-        except:
-            pass
+        rows.append({
+            "代號": code,
+            "名稱": name,
+            "市場": "上櫃",
+            "產業": str(
+                x.get(
+                    "SecuritiesIndustryCode",
+                    x.get("產業別", "")
+                )
+            ).strip(),
+            "股本億": cap / 1e8 if pd.notna(cap) else np.nan,
+            "symbol": code + ".TWO",
+        })
 
-    return None, None
+        seen.add(code)
 
+    cols = ["代號", "名稱", "市場", "產業", "股本億", "symbol"]
 
-# =========================================================
-# 2年行情
-# =========================================================
+    if not rows:
+        return pd.DataFrame(columns=cols)
+
+    return (
+        pd.DataFrame(rows)[cols]
+        .drop_duplicates("代號")
+        .sort_values("代號")
+        .reset_index(drop=True)
+    )
+
 
 @st.cache_data(ttl=3600, show_spinner=False)
-def price_data(symbol):
-
+def price_history(symbol):
     try:
-
-        df = yf.download(
+        d = yf.download(
             symbol,
-            period="2y",
-            progress=False,
+            period="5y",
             auto_adjust=False,
+            progress=False,
             threads=False,
-            timeout=12
+            timeout=15
         )
 
-        if isinstance(df.columns, pd.MultiIndex):
-            df.columns = df.columns.get_level_values(0)
+        if isinstance(d.columns, pd.MultiIndex):
+            d.columns = d.columns.get_level_values(0)
 
-        if df.empty:
+        d.index = pd.to_datetime(d.index)
+
+        required = {"Close", "High", "Low", "Volume"}
+
+        if not required.issubset(set(d.columns)):
             return pd.DataFrame()
 
-        return df.dropna(
-            subset=["Close"]
-        )
+        return d.dropna(subset=["Close"])
 
-    except:
-
+    except Exception:
         return pd.DataFrame()
 
-
-# =========================================================
-# 基本面
-# =========================================================
 
 @st.cache_data(ttl=21600, show_spinner=False)
 def fundamentals(symbol):
 
-    result = {
-        "name": symbol.split(".")[0],
-        "market_cap": np.nan,
-        "capital": np.nan,
-        "rev_growth": np.nan,
-        "earn_growth": np.nan,
-        "gross_margin": np.nan,
-        "op_margin": np.nan,
-        "capex_growth": np.nan,
-        "contract_growth": np.nan,
-        "industry": "",
-        "sector": "",
-        "cashflow_improve": False
+    z = {
+        "市值億": np.nan,
+        "營收成長": np.nan,
+        "獲利成長": np.nan,
+        "毛利率": np.nan,
+        "營益率": np.nan,
+        "CAPEX成長": np.nan,
+        "CAPEX營收比": np.nan,
+        "合約負債成長": np.nan,
+        "現金流改善": np.nan,
+        "存貨變化": np.nan,
+        "應收變化": np.nan,
+        "新聞": []
     }
 
     try:
-
         ticker = yf.Ticker(symbol)
 
-        # -----------------------------------------
-        # 公司基本面
-        # -----------------------------------------
-
         try:
+            info = ticker.get_info() or {}
 
-            info = ticker.get_info()
+            settings = [
+                ("市值億", "marketCap", 1e-8),
+                ("營收成長", "revenueGrowth", 100),
+                ("獲利成長", "earningsGrowth", 100),
+                ("毛利率", "grossMargins", 100),
+                ("營益率", "operatingMargins", 100),
+            ]
 
-            result["name"] = (
-                info.get("shortName")
-                or info.get("longName")
-                or result["name"]
-            )
+            for key, src, mult in settings:
+                v = num(info.get(src, np.nan))
 
-            result["market_cap"] = (
-                num(info.get("marketCap"))
-                / 1e8
-            )
+                if pd.notna(v):
+                    z[key] = v * mult
 
-            shares = num(
-                info.get("sharesOutstanding")
-            )
-
-            if pd.notna(shares):
-
-                result["capital"] = (
-                    shares
-                    * 10
-                    / 1e8
-                )
-
-            result["rev_growth"] = (
-                num(info.get("revenueGrowth"))
-                * 100
-            )
-
-            result["earn_growth"] = (
-                num(info.get("earningsGrowth"))
-                * 100
-            )
-
-            result["gross_margin"] = (
-                num(info.get("grossMargins"))
-                * 100
-            )
-
-            result["op_margin"] = (
-                num(info.get("operatingMargins"))
-                * 100
-            )
-
-            result["industry"] = str(
-                info.get("industry") or ""
-            )
-
-            result["sector"] = str(
-                info.get("sector") or ""
-            )
-
-        except:
+        except Exception:
             pass
 
-        # -----------------------------------------
-        # CAPEX / 現金流
-        # -----------------------------------------
+        def find_row(df, words):
+            if df is None or df.empty:
+                return pd.Series(dtype=float)
+
+            for idx in df.index:
+                if any(w in str(idx).lower() for w in words):
+                    return pd.to_numeric(
+                        df.loc[idx],
+                        errors="coerce"
+                    ).dropna()
+
+            return pd.Series(dtype=float)
 
         try:
-
             cf = ticker.quarterly_cashflow
 
-            if not cf.empty:
+            capex = find_row(
+                cf,
+                ["capital expenditure"]
+            )
 
-                labels = [
-                    str(i).lower()
-                    for i in cf.index
+            if len(capex) >= 5 and capex.iloc[4] != 0:
+                z["CAPEX成長"] = (
+                    abs(capex.iloc[0]) /
+                    abs(capex.iloc[4]) - 1
+                ) * 100
+
+            ocf = find_row(
+                cf,
+                [
+                    "operating cash flow",
+                    "total cash from operating"
                 ]
+            )
 
-                capex_rows = [
-                    i
-                    for i, x in enumerate(labels)
-                    if "capital expenditure" in x
-                ]
+            if len(ocf) >= 2:
+                z["現金流改善"] = bool(
+                    ocf.iloc[0] > ocf.iloc[1]
+                )
 
-                if (
-                    capex_rows
-                    and cf.shape[1] >= 5
-                ):
+            inc = ticker.quarterly_income_stmt
+            rev = find_row(
+                inc,
+                ["total revenue"]
+            )
 
-                    values = pd.to_numeric(
-                        cf.iloc[capex_rows[0]],
-                        errors="coerce"
-                    ).abs().dropna()
+            if len(capex) and len(rev) and rev.iloc[0] != 0:
+                z["CAPEX營收比"] = (
+                    abs(capex.iloc[0]) /
+                    abs(rev.iloc[0]) * 100
+                )
 
-                    if (
-                        len(values) >= 5
-                        and values.iloc[4] != 0
-                    ):
-
-                        result["capex_growth"] = (
-                            values.iloc[0]
-                            / values.iloc[4]
-                            - 1
-                        ) * 100
-
-                operating_rows = [
-                    i
-                    for i, x in enumerate(labels)
-                    if (
-                        "operating cash flow" in x
-                        or
-                        "total cash from operating" in x
-                    )
-                ]
-
-                if (
-                    operating_rows
-                    and cf.shape[1] >= 2
-                ):
-
-                    values = pd.to_numeric(
-                        cf.iloc[operating_rows[0]],
-                        errors="coerce"
-                    ).dropna()
-
-                    if len(values) >= 2:
-
-                        result["cashflow_improve"] = (
-                            values.iloc[0]
-                            >
-                            values.iloc[1]
-                        )
-
-        except:
+        except Exception:
             pass
-
-        # -----------------------------------------
-        # 合約負債
-        # -----------------------------------------
 
         try:
-
             bs = ticker.quarterly_balance_sheet
 
-            if not bs.empty:
+            rows = [
+                ("合約負債成長", ["contract liabil"]),
+                ("存貨變化", ["inventory"]),
+                (
+                    "應收變化",
+                    [
+                        "accounts receivable",
+                        "receivables"
+                    ]
+                ),
+            ]
 
-                labels = [
-                    str(i).lower()
-                    for i in bs.index
-                ]
+            for key, words in rows:
+                s = find_row(bs, words)
 
-                rows = [
-                    i
-                    for i, x in enumerate(labels)
-                    if "contract liabil" in x
-                ]
+                if len(s) >= 2 and s.iloc[1] != 0:
+                    z[key] = (
+                        s.iloc[0] /
+                        s.iloc[1] - 1
+                    ) * 100
 
-                if (
-                    rows
-                    and bs.shape[1] >= 2
-                ):
-
-                    values = pd.to_numeric(
-                        bs.iloc[rows[0]],
-                        errors="coerce"
-                    ).dropna()
-
-                    if (
-                        len(values) >= 2
-                        and values.iloc[1] != 0
-                    ):
-
-                        result["contract_growth"] = (
-                            values.iloc[0]
-                            / values.iloc[1]
-                            - 1
-                        ) * 100
-
-        except:
+        except Exception:
             pass
 
-    except:
+        try:
+            z["新聞"] = ticker.news[:10] if ticker.news else []
+        except Exception:
+            pass
+
+    except Exception:
         pass
 
-    return result
+    return z
 
 
-# =========================================================
-# 技術面
-# =========================================================
+def technical(d, base_months=6):
 
-def tech(df, months):
-
-    close = series(df["Close"])
-    high = series(df["High"])
-    low = series(df["Low"])
-    volume = series(df["Volume"])
-
-    if len(close) < 20:
+    if d.empty:
         return {}
 
-    price = float(close.iloc[-1])
+    c = pd.to_numeric(d["Close"], errors="coerce").dropna()
+    h = pd.to_numeric(d["High"], errors="coerce").dropna()
+    l = pd.to_numeric(d["Low"], errors="coerce").dropna()
+    v = pd.to_numeric(d["Volume"], errors="coerce").dropna()
 
-    peak = float(high.max())
+    if len(c) < 20:
+        return {}
 
-    drawdown = (
-        (peak - price)
-        / peak
-        * 100
+    p = c.iloc[-1]
+
+    peak = h.tail(
+        min(504, len(h))
+    ).max()
+
+    dd = (
+        (peak - p) / peak * 100
         if peak
         else np.nan
     )
 
-    # -----------------------------------------
-    # 築底區間
-    # -----------------------------------------
-
-    days = min(
-        len(df),
+    n = min(
+        len(d),
         max(
-            42,
-            months * 21
+            20,
+            int(base_months or 6) * 21
         )
     )
 
-    recent = df.tail(days)
+    recent = d.tail(n)
 
-    recent_high = num(
-        series(
-            recent["High"]
-        ).max()
-    )
+    rh = pd.to_numeric(
+        recent["High"],
+        errors="coerce"
+    ).max()
 
-    recent_low = num(
-        series(
-            recent["Low"]
-        ).min()
-    )
+    rl = pd.to_numeric(
+        recent["Low"],
+        errors="coerce"
+    ).min()
 
-    base_range = (
-        (
-            recent_high
-            - recent_low
-        )
-        / recent_low
-        * 100
-        if recent_low
+    base = (
+        (rh - rl) / rl * 100
+        if rl
         else np.nan
     )
-
-    # -----------------------------------------
-    # MA60
-    # -----------------------------------------
 
     ma60 = (
-        close
-        .rolling(60)
-        .mean()
-        .iloc[-1]
-        if len(close) >= 60
+        c.rolling(60).mean().iloc[-1]
+        if len(c) >= 60
         else np.nan
     )
 
-    ma_distance = (
-        (
-            price
-            / ma60
-            - 1
-        )
-        * 100
-        if pd.notna(ma60)
-        and ma60
+    ma60d = (
+        (p / ma60 - 1) * 100
+        if pd.notna(ma60) and ma60
         else np.nan
     )
 
-    # -----------------------------------------
-    # 量能
-    # -----------------------------------------
+    w = c.resample("W").last().dropna()
 
-    volume20 = (
-        volume
-        .tail(20)
-        .mean()
-    )
-
-    volume60 = (
-        volume
-        .tail(60)
-        .mean()
-    )
-
-    volume_growth = (
-        (
-            volume20
-            / volume60
-            - 1
-        )
-        * 100
-        if len(volume) >= 60
-        and volume60
+    wma = (
+        w.rolling(20).mean().iloc[-1]
+        if len(w) >= 20
         else np.nan
     )
 
-    # -----------------------------------------
-    # 防止把急跌當築底
-    # -----------------------------------------
+    wd = (
+        (p / wma - 1) * 100
+        if pd.notna(wma) and wma
+        else np.nan
+    )
 
-    change20 = (
+    m = c.resample("ME").last().dropna()
+
+    mma = (
+        m.rolling(20).mean().iloc[-1]
+        if len(m) >= 20
+        else np.nan
+    )
+
+    md = (
+        (p / mma - 1) * 100
+        if pd.notna(mma) and mma
+        else np.nan
+    )
+
+    vg = (
         (
-            price
-            / close.iloc[-20]
-            - 1
-        )
-        * 100
-        if len(close) >= 20
-        and close.iloc[-20]
+            v.tail(20).mean() /
+            v.tail(60).mean() - 1
+        ) * 100
+        if len(v) >= 60 and v.tail(60).mean()
+        else np.nan
+    )
+
+    r20 = (
+        (p / c.iloc[-20] - 1) * 100
+        if len(c) >= 20
+        else np.nan
+    )
+
+    r60 = (
+        (p / c.iloc[-60] - 1) * 100
+        if len(c) >= 60
+        else np.nan
+    )
+
+    mr = m.pct_change() * 100
+
+    same = mr[
+        (mr.index.month == datetime.now().month) &
+        (mr.index.year < datetime.now().year)
+    ].dropna()
+
+    cyc = (
+        same.mean()
+        if len(same) >= 2
         else np.nan
     )
 
     return {
-        "price": price,
-        "drawdown": drawdown,
-        "base": base_range,
-        "ma60": ma_distance,
-        "volume": volume_growth,
-        "change20": change20
+        "現價": p,
+        "高點回落": dd,
+        "築底區間": base,
+        "MA60距離": ma60d,
+        "週MA20距離": wd,
+        "月MA20距離": md,
+        "量能": vg,
+        "20日漲跌": r20,
+        "60日漲跌": r60,
+        "歷史同月平均": cyc
     }
 
 
-# =========================================================
-# 通用條件判斷
-# =========================================================
+def news_events(news):
 
-def evaluate(
-    label,
+    titles = []
+
+    for item in news:
+        if isinstance(item, dict):
+            content = item.get("content", item)
+
+            if isinstance(content, dict) and content.get("title"):
+                titles.append(
+                    str(content["title"])
+                )
+
+    joined = " ".join(titles).lower()
+
+    rules = {
+        "合作": [
+            "合作",
+            "partnership",
+            "alliance",
+            "strategic"
+        ],
+        "新客戶/訂單": [
+            "訂單",
+            "客戶",
+            "order",
+            "customer",
+            "供應鏈"
+        ],
+        "擴產": [
+            "擴產",
+            "新廠",
+            "產能",
+            "設備",
+            "capacity",
+            "plant"
+        ],
+        "新產品/認證": [
+            "新品",
+            "新產品",
+            "認證",
+            "certification"
+        ],
+        "併購投資": [
+            "併購",
+            "收購",
+            "投資",
+            "acquisition",
+            "merger"
+        ]
+    }
+
+    events = [
+        k
+        for k, words in rules.items()
+        if any(
+            w.lower() in joined
+            for w in words
+        )
+    ]
+
+    return events, titles[:5]
+
+
+@st.cache_data(ttl=21600, show_spinner=False)
+def official_cb_codes():
+    """
+    CB 官方頁存在，但目前不從 HTML 中任意抓四位數
+    當作公司代號，以免把日期、債券代號等誤認成股票代號。
+    沒有可靠結構化欄位時回空集合。
+    """
+    return set()
+
+
+def eval_num(
     value,
     threshold,
     direction,
     selected_mode,
+    label,
+    reasons,
     score,
-    reasons
+    weight=10
+):
+
+    if selected_mode == "關閉" or threshold == 0:
+        return True, score
+
+    if pd.isna(value):
+        return (
+            False if selected_mode == "必要"
+            else True
+        ), score
+
+    if direction == "ge":
+        ok = value >= threshold
+
+    elif direction == "le":
+        ok = value <= threshold
+
+    else:
+        ok = abs(value) <= threshold
+
+    if ok:
+        reasons.append(
+            f"{label} {value:.1f}"
+        )
+        score += weight
+
+    return (
+        ok if selected_mode == "必要"
+        else True
+    ), score
+
+
+def eval_bool(
+    value,
+    selected_mode,
+    label,
+    reasons,
+    score,
+    weight=10,
+    missing=False
 ):
 
     if selected_mode == "關閉":
         return True, score
 
-    if pd.isna(value):
+    if missing:
+        return (
+            False if selected_mode == "必要"
+            else True
+        ), score
 
-        if selected_mode == "必要":
-            return False, score
-
-        return True, score
-
-    if direction == "ge":
-
-        ok = (
-            value
-            >= threshold
-        )
-
-    else:
-
-        ok = (
-            value
-            <= threshold
-        )
+    ok = bool(value)
 
     if ok:
+        reasons.append(label)
+        score += weight
 
-        if selected_mode == "加分":
-            score += 10
-
-        reasons.append(
-            f"{label} {value:.1f}"
-        )
-
-        return True, score
-
-    if selected_mode == "必要":
-        return False, score
-
-    return True, score
+    return (
+        ok if selected_mode == "必要"
+        else True
+    ), score
 
 
-# =========================================================
-# 側邊欄
-# =========================================================
+def mode(label, key):
+    return st.selectbox(
+        label,
+        MODES,
+        index=0,
+        key=key
+    )
+
 
 with st.sidebar:
 
-    st.header("🎛️ 多邏輯條件")
+    st.header("條件")
 
-    st.caption(
-        "每一項都可以獨立使用"
-    )
-
-    market_filter = st.multiselect(
+    markets = st.multiselect(
         "市場",
         [
             "上市",
@@ -539,1254 +614,953 @@ with st.sidebar:
         ]
     )
 
-    st.divider()
-
-    # ==========================================
-    # 價格邏輯
-    # ==========================================
-
-    st.subheader("價格／築底")
-
-    drawdown_mode = mode(
-        "高點回落",
-        "drawdown_mode",
-        "必要"
+    ddm = mode("高點回落", "ddm")
+    dd = st.selectbox(
+        "回落門檻 %",
+        [0, 30, 40, 50, 60, 70]
     )
 
-    drawdown_threshold = st.selectbox(
-        "跌幅門檻 %",
-        [
-            0,
-            30,
-            40,
-            50,
-            60,
-            70
-        ],
-        index=3
+    bm = mode("築底", "bm")
+    bmo = st.selectbox(
+        "築底月數",
+        [0, 2, 3, 6, 12, 18, 24]
+    )
+    br = st.selectbox(
+        "築底最大區間 %",
+        [0, 10, 15, 20, 25, 30, 40, 50]
     )
 
-    base_mode = mode(
-        "築底／收斂",
-        "base_mode",
-        "必要"
+    m60 = mode("MA60", "m60")
+    m60v = st.selectbox(
+        "MA60距離 ±%",
+        [0, 5, 10, 15, 20, 30]
     )
 
-    base_months = st.selectbox(
-        "觀察月數",
-        [
-            2,
-            3,
-            6,
-            12,
-            18,
-            24
-        ],
-        index=2
+    wm = mode("週MA20", "wm")
+    wmv = st.selectbox(
+        "週MA20距離 ±%",
+        [0, 5, 10, 15, 20, 30]
     )
 
-    base_threshold = st.selectbox(
-        "最大區間 %",
-        [
-            0,
-            15,
-            20,
-            25,
-            30,
-            40,
-            50
-        ],
-        index=2
+    mm = mode("月MA20", "mm")
+    mmv = st.selectbox(
+        "月MA20距離 ±%",
+        [0, 5, 10, 15, 20, 30]
     )
 
-    ma_mode = mode(
-        "接近 MA60",
-        "ma_mode",
-        "加分"
+    vm = mode("底部量能", "vm")
+    vv = st.selectbox(
+        "量能門檻 %",
+        [0, 10, 20, 30, 50, 100]
     )
 
-    ma_threshold = st.selectbox(
-        "MA60 距離 ±%",
-        [
-            0,
-            5,
-            10,
-            15,
-            20
-        ],
-        index=2
+    rm = mode("營收成長", "rm")
+    rv = st.selectbox(
+        "營收門檻 %",
+        [0, 5, 10, 20, 30, 50, 100]
     )
 
-    volume_mode = mode(
-        "底部放量",
-        "volume_mode",
-        "加分"
+    em = mode("獲利成長", "em")
+    ev = st.selectbox(
+        "獲利門檻 %",
+        [0, 5, 10, 20, 30, 50, 100]
     )
 
-    volume_threshold = st.selectbox(
-        "放量門檻 %",
-        [
-            0,
-            10,
-            20,
-            30,
-            50,
-            100
-        ],
-        index=3
+    cm = mode("CAPEX成長", "cm")
+    cv = st.selectbox(
+        "CAPEX門檻 %",
+        [0, 10, 20, 30, 50, 100, 200]
     )
 
-    st.divider()
-
-    # ==========================================
-    # 基本面邏輯
-    # ==========================================
-
-    st.subheader("基本面轉折")
-
-    revenue_mode = mode(
-        "營收成長",
-        "revenue_mode",
-        "加分"
+    crm = mode("CAPEX/營收", "crm")
+    crv = st.selectbox(
+        "CAPEX/營收門檻 %",
+        [0, 5, 10, 20, 30, 50]
     )
 
-    revenue_threshold = st.selectbox(
-        "營收成長門檻 %",
-        [
-            0,
-            5,
-            10,
-            20,
-            30,
-            50
-        ],
-        index=0
+    clm = mode("合約負債", "clm")
+    clv = st.selectbox(
+        "合約負債門檻 %",
+        [0, 10, 20, 30, 50, 100]
     )
 
-    earnings_mode = mode(
-        "獲利成長",
-        "earnings_mode",
-        "加分"
-    )
-
-    earnings_threshold = st.selectbox(
-        "獲利成長門檻 %",
-        [
-            0,
-            5,
-            10,
-            20,
-            30,
-            50
-        ],
-        index=0
-    )
-
-    cashflow_mode = mode(
+    cfm = mode(
         "營業現金流改善",
-        "cashflow_mode",
-        "加分"
+        "cfm"
     )
 
-    st.divider()
-
-    # ==========================================
-    # 擴張型
-    # ==========================================
-
-    st.subheader("擴張／訂單")
-
-    capex_mode = mode(
-        "CAPEX增加",
-        "capex_mode",
-        "加分"
+    mcm = mode("市值", "mcm")
+    mcv = st.selectbox(
+        "市值上限 億",
+        [0, 50, 100, 200, 300, 500, 1000, 3000]
     )
 
-    capex_threshold = st.selectbox(
-        "CAPEX年增門檻 %",
-        [
-            0,
-            10,
-            20,
-            30,
-            50,
-            100
-        ],
-        index=3
+    cam = mode("股本", "cam")
+    cav = st.selectbox(
+        "股本上限 億",
+        [0, 10, 20, 30, 50, 100, 200]
     )
 
-    contract_mode = mode(
-        "合約負債增加",
-        "contract_mode",
-        "加分"
+    etm = mode(
+        "合作/客戶/擴產事件",
+        "etm"
     )
 
-    contract_threshold = st.selectbox(
-        "合約負債成長門檻 %",
-        [
-            0,
-            10,
-            20,
-            30,
-            50
-        ],
-        index=2
+    gm = mode("群體性", "gm")
+    gv = st.selectbox(
+        "同產業同步轉強比例 %",
+        [0, 30, 40, 50, 60, 70]
     )
 
-    st.divider()
-
-    # ==========================================
-    # 公司大小
-    # ==========================================
-
-    st.subheader("公司大小")
-
-    size_mode = mode(
-        "中小型股",
-        "size_mode",
-        "加分"
+    rom = mode("族群輪動", "rom")
+    rov = st.selectbox(
+        "產業平均20日漲幅 %",
+        [0, 3, 5, 10, 15, 20]
     )
 
-    max_market_cap = st.number_input(
-        "市值上限（億）",
-        value=500.0
-    )
-
-    max_capital = st.number_input(
-        "股本上限（億）",
-        value=50.0
-    )
-
-    st.divider()
-
-    # ==========================================
-    # 事件／群體型
-    # ==========================================
-
-    st.subheader("事件／群體")
-
-    cb_mode = mode(
-        "CB事件",
-        "cb_mode",
-        "關閉"
-    )
-
-    event_mode = mode(
-        "合作／擴產／新客戶",
-        "event_mode",
-        "關閉"
-    )
-
-    group_mode = mode(
-        "群體性",
-        "group_mode",
-        "關閉"
-    )
-
-    rotation_mode = mode(
-        "族群輪動",
-        "rotation_mode",
-        "關閉"
-    )
-
-    cycle_mode = mode(
-        "歷史循環",
-        "cycle_mode",
-        "關閉"
+    cym = mode("歷史循環", "cym")
+    cyv = st.selectbox(
+        "歷史同月平均 %",
+        [0, 3, 5, 10, 15, 20]
     )
 
 
-# =========================================================
-# 頁面
-# =========================================================
+pool = stock_pool()
+cb_codes = official_cb_codes()
 
-tab1, tab2, tab3, tab4 = st.tabs(
-    [
-        "🚨 全市場雷達",
-        "🔍 個股完整檢查",
-        "🧠 邏輯說明",
-        "⭐ 自選觀察"
-    ]
-)
+tabs = st.tabs([
+    "雷達",
+    "個股",
+    "族群＋CB",
+    "資料來源/健康檢查"
+])
 
 
-# =========================================================
-# 全市場雷達
-# =========================================================
+with tabs[0]:
 
-with tab1:
-
-    st.subheader(
-        "全市場多邏輯雷達"
+    selected = (
+        pool[
+            pool["市場"].isin(markets)
+        ].copy()
+        if not pool.empty
+        else pool
     )
 
-    c1, c2 = st.columns(2)
-
-    start_code = int(
-        c1.number_input(
-            "起始代號",
-            1101,
-            9999,
-            1101,
-            100
-        )
+    st.metric(
+        "股票池",
+        len(selected)
     )
 
-    scan_count = c2.selectbox(
-        "掃描數量",
-        [
-            20,
-            50,
-            100,
-            200,
-            500
-        ],
+    limit = st.selectbox(
+        "本次掃描檔數",
+        [20, 50, 100, 200],
         index=1
     )
 
-    if st.button(
-        "🚀 開始雷達掃描",
-        type="primary"
-    ):
+    start = st.text_input(
+        "從代號開始（空白＝最前面）"
+    ).strip()
 
-        rows = []
+    work = (
+        selected[
+            selected["代號"] >= start
+        ].head(limit)
+        if start
+        else selected.head(limit)
+    )
 
-        progress = st.progress(0)
+    active_modes = [
+        ddm,
+        bm,
+        m60,
+        wm,
+        mm,
+        vm,
+        rm,
+        em,
+        cm,
+        crm,
+        clm,
+        cfm,
+        mcm,
+        cam,
+        etm,
+        gm,
+        rom,
+        cym
+    ]
 
-        status = st.empty()
+    all_off = all(
+        x == "關閉"
+        for x in active_modes
+    )
 
-        codes = range(
-            start_code,
-            min(
-                10000,
-                start_code
-                + scan_count
-            )
+    if all_off and not work.empty:
+
+        st.info(
+            "全部條件關閉："
+            "直接顯示股票，不做任何淘汰。"
         )
 
-        for index, number in enumerate(codes):
+        st.dataframe(
+            work[
+                [
+                    "代號",
+                    "名稱",
+                    "市場",
+                    "產業",
+                    "股本億"
+                ]
+            ],
+            use_container_width=True,
+            hide_index=True
+        )
 
-            code = str(number)
+    if st.button(
+        "開始掃描",
+        type="primary",
+        use_container_width=True
+    ):
 
-            status.write(
-                f"掃描 {code}"
+        if work.empty:
+
+            st.error(
+                "股票池目前沒有資料；"
+                "這不是『沒有符合股票』。"
             )
 
-            symbol, market = (
-                resolve_symbol(code)
-            )
-
-            if (
-                symbol
-                and
-                market
-                in market_filter
-            ):
-
-                prices = price_data(
-                    symbol
-                )
-
-                if len(prices) >= 60:
-
-                    technical = tech(
-                        prices,
-                        base_months
-                    )
-
-                    fundamental = fundamentals(
-                        symbol
-                    )
-
-                    keep = True
-
-                    score = 0
-
-                    reasons = []
-
-                    # ==================================
-                    # 跌幅
-                    # ==================================
-
-                    keep, score = evaluate(
-                        "高點回落%",
-                        technical.get(
-                            "drawdown",
-                            np.nan
-                        ),
-                        drawdown_threshold,
-                        "ge",
-                        drawdown_mode,
-                        score,
-                        reasons
-                    )
-
-                    # ==================================
-                    # 築底
-                    # ==================================
-
-                    if (
-                        keep
-                        and
-                        base_mode
-                        != "關閉"
-                    ):
-
-                        value = technical.get(
-                            "base",
-                            np.nan
-                        )
-
-                        ok = (
-                            pd.notna(value)
-                            and
-                            (
-                                base_threshold == 0
-                                or
-                                value
-                                <= base_threshold
-                            )
-                            and
-                            technical.get(
-                                "change20",
-                                -99
-                            )
-                            > -15
-                        )
-
-                        if ok:
-
-                            if (
-                                base_mode
-                                == "加分"
-                            ):
-                                score += 10
-
-                            reasons.append(
-                                f"{base_months}月築底 "
-                                f"{value:.1f}%"
-                            )
-
-                        elif (
-                            base_mode
-                            == "必要"
-                        ):
-
-                            keep = False
-
-                    # ==================================
-                    # MA60
-                    # ==================================
-
-                    if (
-                        keep
-                        and
-                        ma_mode
-                        != "關閉"
-                    ):
-
-                        value = abs(
-                            technical.get(
-                                "ma60",
-                                np.nan
-                            )
-                        )
-
-                        keep, score = evaluate(
-                            "距MA60%",
-                            value,
-                            ma_threshold,
-                            "le",
-                            ma_mode,
-                            score,
-                            reasons
-                        )
-
-                    # ==================================
-                    # 量能
-                    # ==================================
-
-                    if keep:
-
-                        keep, score = evaluate(
-                            "量能變化%",
-                            technical.get(
-                                "volume",
-                                np.nan
-                            ),
-                            volume_threshold,
-                            "ge",
-                            volume_mode,
-                            score,
-                            reasons
-                        )
-
-                    # ==================================
-                    # 營收
-                    # ==================================
-
-                    if keep:
-
-                        keep, score = evaluate(
-                            "營收成長%",
-                            fundamental[
-                                "rev_growth"
-                            ],
-                            revenue_threshold,
-                            "ge",
-                            revenue_mode,
-                            score,
-                            reasons
-                        )
-
-                    # ==================================
-                    # 獲利
-                    # ==================================
-
-                    if keep:
-
-                        keep, score = evaluate(
-                            "獲利成長%",
-                            fundamental[
-                                "earn_growth"
-                            ],
-                            earnings_threshold,
-                            "ge",
-                            earnings_mode,
-                            score,
-                            reasons
-                        )
-
-                    # ==================================
-                    # CAPEX
-                    # ==================================
-
-                    if keep:
-
-                        keep, score = evaluate(
-                            "CAPEX成長%",
-                            fundamental[
-                                "capex_growth"
-                            ],
-                            capex_threshold,
-                            "ge",
-                            capex_mode,
-                            score,
-                            reasons
-                        )
-
-                    # ==================================
-                    # 合約負債
-                    # ==================================
-
-                    if keep:
-
-                        keep, score = evaluate(
-                            "合約負債成長%",
-                            fundamental[
-                                "contract_growth"
-                            ],
-                            contract_threshold,
-                            "ge",
-                            contract_mode,
-                            score,
-                            reasons
-                        )
-
-                    # ==================================
-                    # 現金流
-                    # ==================================
-
-                    if (
-                        keep
-                        and
-                        cashflow_mode
-                        != "關閉"
-                    ):
-
-                        ok = fundamental[
-                            "cashflow_improve"
-                        ]
-
-                        if ok:
-
-                            if (
-                                cashflow_mode
-                                == "加分"
-                            ):
-                                score += 10
-
-                            reasons.append(
-                                "營業現金流改善"
-                            )
-
-                        elif (
-                            cashflow_mode
-                            == "必要"
-                        ):
-
-                            keep = False
-
-                    # ==================================
-                    # 中小型股
-                    # ==================================
-
-                    if (
-                        keep
-                        and
-                        size_mode
-                        != "關閉"
-                    ):
-
-                        market_cap = fundamental[
-                            "market_cap"
-                        ]
-
-                        capital = fundamental[
-                            "capital"
-                        ]
-
-                        known = (
-                            pd.notna(
-                                market_cap
-                            )
-                            or
-                            pd.notna(
-                                capital
-                            )
-                        )
-
-                        ok = (
-                            (
-                                pd.isna(
-                                    market_cap
-                                )
-                                or
-                                market_cap
-                                <= max_market_cap
-                            )
-                            and
-                            (
-                                pd.isna(
-                                    capital
-                                )
-                                or
-                                capital
-                                <= max_capital
-                            )
-                        )
-
-                        if (
-                            known
-                            and
-                            ok
-                        ):
-
-                            if (
-                                size_mode
-                                == "加分"
-                            ):
-                                score += 10
-
-                            reasons.append(
-                                "中小市值／低股本"
-                            )
-
-                        elif (
-                            size_mode
-                            == "必要"
-                        ):
-
-                            keep = False
-
-                    # ==================================
-                    # 尚未有可靠結構化資料的項目
-                    # 不准把「未知」當成「符合」
-                    # ==================================
-
-                    unavailable = [
-                        (
-                            "CB",
-                            cb_mode
-                        ),
-                        (
-                            "合作／擴產／新客戶",
-                            event_mode
-                        ),
-                        (
-                            "群體性",
-                            group_mode
-                        ),
-                        (
-                            "族群輪動",
-                            rotation_mode
-                        ),
-                        (
-                            "歷史循環",
-                            cycle_mode
-                        )
-                    ]
-
-                    for (
-                        label,
-                        selected_mode
-                    ) in unavailable:
-
-                        if (
-                            selected_mode
-                            == "必要"
-                        ):
-                            keep = False
-
-                    # ==================================
-                    # 最終結果
-                    # ==================================
-
-                    if keep:
-
-                        rows.append(
-                            {
-                                "代號":
-                                    code,
-
-                                "名稱":
-                                    fundamental[
-                                        "name"
-                                    ],
-
-                                "市場":
-                                    market,
-
-                                "現價":
-                                    round(
-                                        technical[
-                                            "price"
-                                        ],
-                                        2
-                                    ),
-
-                                "跌幅":
-                                    f"{technical['drawdown']:.1f}%",
-
-                                "築底區間":
-                                    f"{technical['base']:.1f}%",
-
-                                "營收成長":
-                                    (
-                                        ""
-                                        if
-                                        pd.isna(
-                                            fundamental[
-                                                "rev_growth"
-                                            ]
-                                        )
-                                        else
-                                        f"{fundamental['rev_growth']:.1f}%"
-                                    ),
-
-                                "獲利成長":
-                                    (
-                                        ""
-                                        if
-                                        pd.isna(
-                                            fundamental[
-                                                "earn_growth"
-                                            ]
-                                        )
-                                        else
-                                        f"{fundamental['earn_growth']:.1f}%"
-                                    ),
-
-                                "CAPEX":
-                                    (
-                                        ""
-                                        if
-                                        pd.isna(
-                                            fundamental[
-                                                "capex_growth"
-                                            ]
-                                        )
-                                        else
-                                        f"{fundamental['capex_growth']:.1f}%"
-                                    ),
-
-                                "合約負債":
-                                    (
-                                        ""
-                                        if
-                                        pd.isna(
-                                            fundamental[
-                                                "contract_growth"
-                                            ]
-                                        )
-                                        else
-                                        f"{fundamental['contract_growth']:.1f}%"
-                                    ),
-
-                                "分數":
-                                    score,
-
-                                "為什麼抓到":
-                                    (
-                                        " → ".join(
-                                            reasons
-                                        )
-                                        or
-                                        "目前啟用條件皆未限制"
-                                    )
-                            }
-                        )
-
-            progress.progress(
-                (
-                    index + 1
-                )
-                / scan_count
-            )
-
-        status.empty()
-
-        if rows:
-
-            result = pd.DataFrame(
-                rows
-            )
-
-            result = result.sort_values(
-                "分數",
-                ascending=False
-            )
-
-            st.success(
-                f"找到 {len(result)} 檔"
-            )
+        elif all_off:
+
+            out = work[
+                [
+                    "代號",
+                    "名稱",
+                    "市場",
+                    "產業",
+                    "股本億"
+                ]
+            ].copy()
+
+            out["分數"] = 0
+            out["為什麼抓到"] = "全部條件關閉"
 
             st.dataframe(
-                result,
+                out,
                 use_container_width=True,
                 hide_index=True
             )
 
         else:
 
-            st.warning(
-                "本次沒有符合「必要」條件的股票。"
-                "不想限制的條件請改成「關閉」。"
-            )
+            res = []
+            bar = st.progress(0)
 
+            for n, (_, r) in enumerate(
+                work.iterrows(),
+                1
+            ):
 
-# =========================================================
-# 個股完整檢查
-# =========================================================
+                tech = technical(
+                    price_history(
+                        r["symbol"]
+                    ),
+                    bmo or 6
+                )
 
-with tab2:
+                fund = fundamentals(
+                    r["symbol"]
+                )
 
-    st.subheader(
-        "單一股票完整檢查"
-    )
+                keep = True
+                score = 0
+                why = []
 
-    stock_code = st.text_input(
-        "股票代號，例如 2330、6488"
-    )
+                tests = [
+                    (
+                        tech.get(
+                            "高點回落",
+                            np.nan
+                        ),
+                        dd,
+                        "ge",
+                        ddm,
+                        "高點回落%"
+                    ),
+                    (
+                        tech.get(
+                            "築底區間",
+                            np.nan
+                        ),
+                        br,
+                        "le",
+                        bm if bmo else "關閉",
+                        f"{bmo}月築底區間%"
+                    ),
+                    (
+                        tech.get(
+                            "MA60距離",
+                            np.nan
+                        ),
+                        m60v,
+                        "abs",
+                        m60,
+                        "MA60距離%"
+                    ),
+                    (
+                        tech.get(
+                            "週MA20距離",
+                            np.nan
+                        ),
+                        wmv,
+                        "abs",
+                        wm,
+                        "週MA20距離%"
+                    ),
+                    (
+                        tech.get(
+                            "月MA20距離",
+                            np.nan
+                        ),
+                        mmv,
+                        "abs",
+                        mm,
+                        "月MA20距離%"
+                    ),
+                    (
+                        tech.get(
+                            "量能",
+                            np.nan
+                        ),
+                        vv,
+                        "ge",
+                        vm,
+                        "量能%"
+                    ),
+                    (
+                        fund["營收成長"],
+                        rv,
+                        "ge",
+                        rm,
+                        "營收成長%"
+                    ),
+                    (
+                        fund["獲利成長"],
+                        ev,
+                        "ge",
+                        em,
+                        "獲利成長%"
+                    ),
+                    (
+                        fund["CAPEX成長"],
+                        cv,
+                        "ge",
+                        cm,
+                        "CAPEX成長%"
+                    ),
+                    (
+                        fund["CAPEX營收比"],
+                        crv,
+                        "ge",
+                        crm,
+                        "CAPEX/營收%"
+                    ),
+                    (
+                        fund["合約負債成長"],
+                        clv,
+                        "ge",
+                        clm,
+                        "合約負債%"
+                    ),
+                    (
+                        fund["市值億"],
+                        mcv,
+                        "le",
+                        mcm,
+                        "市值億"
+                    ),
+                    (
+                        r["股本億"],
+                        cav,
+                        "le",
+                        cam,
+                        "股本億"
+                    ),
+                ]
 
-    if st.button(
-        "分析這一檔"
-    ):
+                for (
+                    value,
+                    threshold,
+                    direction,
+                    md,
+                    label
+                ) in tests:
 
-        stock_code = stock_code.strip()
+                    if keep:
+                        keep, score = eval_num(
+                            value,
+                            threshold,
+                            direction,
+                            md,
+                            label,
+                            why,
+                            score
+                        )
 
-        symbol, market = (
-            resolve_symbol(
-                stock_code
-            )
-        )
+                if keep:
 
-        if not symbol:
+                    keep, score = eval_bool(
+                        fund[
+                            "現金流改善"
+                        ],
+                        cfm,
+                        "營業現金流改善",
+                        why,
+                        score,
+                        missing=pd.isna(
+                            fund[
+                                "現金流改善"
+                            ]
+                        )
+                    )
 
-            st.error(
-                "找不到上市／上櫃行情"
-            )
+                evs, titles = news_events(
+                    fund["新聞"]
+                )
 
-        else:
+                if keep:
 
-            prices = price_data(
-                symbol
-            )
+                    keep, score = eval_bool(
+                        bool(evs),
+                        etm,
+                        "事件：" + ",".join(evs),
+                        why,
+                        score
+                    )
 
-            fundamental = fundamentals(
-                symbol
-            )
+                if keep:
 
-            if prices.empty:
+                    res.append({
+                        "代號":
+                            r["代號"],
 
-                st.error(
-                    "抓不到行情"
+                        "名稱":
+                            r["名稱"],
+
+                        "市場":
+                            r["市場"],
+
+                        "產業":
+                            r["產業"] or "未分類",
+
+                        "現價":
+                            tech.get(
+                                "現價",
+                                np.nan
+                            ),
+
+                        "高點回落%":
+                            tech.get(
+                                "高點回落",
+                                np.nan
+                            ),
+
+                        "20日漲跌%":
+                            tech.get(
+                                "20日漲跌",
+                                np.nan
+                            ),
+
+                        "量能%":
+                            tech.get(
+                                "量能",
+                                np.nan
+                            ),
+
+                        "營收成長%":
+                            fund[
+                                "營收成長"
+                            ],
+
+                        "CAPEX成長%":
+                            fund[
+                                "CAPEX成長"
+                            ],
+
+                        "合約負債%":
+                            fund[
+                                "合約負債成長"
+                            ],
+
+                        "歷史同月%":
+                            tech.get(
+                                "歷史同月平均",
+                                np.nan
+                            ),
+
+                        "事件":
+                            ",".join(evs),
+
+                        "分數":
+                            score,
+
+                        "理由":
+                            why
+                    })
+
+                bar.progress(
+                    n / max(
+                        len(work),
+                        1
+                    )
+                )
+
+            if not res:
+
+                st.warning(
+                    "沒有股票通過目前的"
+                    "『必要』條件，"
+                    "或必要資料缺失。"
                 )
 
             else:
 
-                technical = tech(
-                    prices,
-                    base_months
-                )
+                d = pd.DataFrame(res)
 
-                st.header(
-                    f"{stock_code} "
-                    f"{fundamental['name']}｜"
-                    f"{market}"
-                )
+                group_stats = {}
 
-                c1, c2, c3, c4 = (
-                    st.columns(4)
-                )
+                for industry, g in d.groupby(
+                    "產業"
+                ):
 
-                c1.metric(
-                    "現價",
-                    f"{technical['price']:.2f}"
-                )
-
-                c2.metric(
-                    "2年高點回落",
-                    f"{technical['drawdown']:.1f}%"
-                )
-
-                c3.metric(
-                    "MA60距離",
-                    (
-                        f"{technical['ma60']:+.1f}%"
-                        if
-                        pd.notna(
-                            technical[
-                                "ma60"
-                            ]
-                        )
-                        else
-                        "缺資料"
-                    )
-                )
-
-                c4.metric(
-                    "量能變化",
-                    (
-                        f"{technical['volume']:+.1f}%"
-                        if
-                        pd.notna(
-                            technical[
-                                "volume"
-                            ]
-                        )
-                        else
-                        "缺資料"
-                    )
-                )
-
-                st.line_chart(
-                    prices["Close"]
-                )
-
-                details = pd.DataFrame(
-                    [
+                    valid = g[
                         [
-                            "市場",
-                            market
-                        ],
-                        [
-                            "產業",
-                            fundamental[
-                                "industry"
-                            ]
-                            or
-                            fundamental[
-                                "sector"
-                            ]
-                            or
-                            "缺資料"
-                        ],
-                        [
-                            "市值（億）",
-                            fundamental[
-                                "market_cap"
-                            ]
-                        ],
-                        [
-                            "股本估算（億）",
-                            fundamental[
-                                "capital"
-                            ]
-                        ],
-                        [
-                            "營收成長%",
-                            fundamental[
-                                "rev_growth"
-                            ]
-                        ],
-                        [
-                            "獲利成長%",
-                            fundamental[
-                                "earn_growth"
-                            ]
-                        ],
-                        [
-                            "毛利率%",
-                            fundamental[
-                                "gross_margin"
-                            ]
-                        ],
-                        [
-                            "營業利益率%",
-                            fundamental[
-                                "op_margin"
-                            ]
-                        ],
-                        [
-                            "CAPEX成長%",
-                            fundamental[
-                                "capex_growth"
-                            ]
-                        ],
-                        [
-                            "合約負債成長%",
-                            fundamental[
-                                "contract_growth"
-                            ]
-                        ],
-                        [
-                            "營業現金流改善",
-                            (
-                                "是"
-                                if
-                                fundamental[
-                                    "cashflow_improve"
-                                ]
-                                else
-                                "否／缺資料"
-                            )
+                            "20日漲跌%",
+                            "量能%"
                         ]
-                    ],
-                    columns=[
-                        "雷達項目",
-                        "目前值"
-                    ]
-                )
+                    ].dropna()
 
-                st.dataframe(
-                    details,
-                    use_container_width=True,
-                    hide_index=True
-                )
-
-                st.caption(
-                    "資料抓取時間："
-                    + datetime.now().strftime(
-                        "%Y-%m-%d %H:%M:%S"
+                    ratio = (
+                        (
+                            (
+                                (
+                                    valid[
+                                        "20日漲跌%"
+                                    ] > 0
+                                )
+                                &
+                                (
+                                    valid[
+                                        "量能%"
+                                    ] > 0
+                                )
+                            ).mean()
+                            * 100
+                        )
+                        if len(valid)
+                        else np.nan
                     )
-                )
+
+                    avg = pd.to_numeric(
+                        g[
+                            "20日漲跌%"
+                        ],
+                        errors="coerce"
+                    ).mean()
+
+                    group_stats[
+                        industry
+                    ] = (
+                        ratio,
+                        avg
+                    )
+
+                final = []
+
+                for _, r in d.iterrows():
+
+                    keep = True
+                    score = int(
+                        r["分數"]
+                    )
+                    why = list(
+                        r["理由"]
+                    )
+
+                    ratio, avg = (
+                        group_stats[
+                            r["產業"]
+                        ]
+                    )
+
+                    keep, score = eval_num(
+                        ratio,
+                        gv,
+                        "ge",
+                        gm,
+                        "同產業同步轉強%",
+                        why,
+                        score,
+                        15
+                    )
+
+                    if keep:
+
+                        keep, score = eval_num(
+                            avg,
+                            rov,
+                            "ge",
+                            rom,
+                            "產業平均20日%",
+                            why,
+                            score,
+                            15
+                        )
+
+                    if keep:
+
+                        keep, score = eval_num(
+                            r[
+                                "歷史同月%"
+                            ],
+                            cyv,
+                            "ge",
+                            cym,
+                            "歷史同月平均%",
+                            why,
+                            score
+                        )
+
+                    if keep:
+
+                        x = r.to_dict()
+
+                        x[
+                            "群體同步%"
+                        ] = ratio
+
+                        x[
+                            "產業20日%"
+                        ] = avg
+
+                        x[
+                            "分數"
+                        ] = score
+
+                        x[
+                            "為什麼抓到"
+                        ] = (
+                            " → ".join(why)
+                            if why
+                            else
+                            "未被必要條件淘汰"
+                        )
+
+                        final.append(x)
+
+                if final:
+
+                    o = (
+                        pd.DataFrame(final)
+                        .sort_values(
+                            [
+                                "分數",
+                                "代號"
+                            ],
+                            ascending=[
+                                False,
+                                True
+                            ]
+                        )
+                    )
+
+                    cols = [
+                        "代號",
+                        "名稱",
+                        "市場",
+                        "產業",
+                        "現價",
+                        "高點回落%",
+                        "營收成長%",
+                        "CAPEX成長%",
+                        "合約負債%",
+                        "事件",
+                        "群體同步%",
+                        "產業20日%",
+                        "歷史同月%",
+                        "分數",
+                        "為什麼抓到"
+                    ]
+
+                    st.dataframe(
+                        o[cols],
+                        use_container_width=True,
+                        hide_index=True
+                    )
+
+                else:
+
+                    st.warning(
+                        "群體性／輪動／循環的"
+                        "必要條件淘汰了全部股票。"
+                    )
 
 
-# =========================================================
-# 邏輯說明
-# =========================================================
+with tabs[1]:
 
-with tab3:
-
-    st.subheader(
-        "多套選股邏輯"
-    )
-
-    st.markdown(
-        """
-### 關閉
-完全不參與判斷。
-
-### 加分
-有符合就加分，沒有符合不淘汰。
-
-### 必要
-一定要符合，否則直接排除。
-
----
-
-因此可以分開跑：
-
-**邏輯 A｜重跌築底**
-
-跌幅＝必要  
-築底＝必要  
-其他＝關閉或加分
-
-**邏輯 B｜基本面轉折**
-
-跌幅＝關閉  
-築底＝關閉  
-營收＝必要  
-獲利＝加分  
-現金流＝加分
-
-**邏輯 C｜公司正在擴張**
-
-跌幅＝關閉  
-CAPEX＝必要  
-合約負債＝加分  
-營收＝加分
-
-**邏輯 D｜小公司開始有變化**
-
-中小型股＝必要  
-營收＝加分  
-CAPEX＝加分  
-量能＝加分
-
-**邏輯 E｜未來群體雷達**
-
-群體性  
-族群輪動  
-供應鏈  
-同產業同步變化
-
----
-
-目前真正參與程式運算：
-
-- 2年高點回落
-- 築底／波動收斂
-- 防止一路急跌被誤判築底
-- MA60
-- 底部量能
-- 市值
-- 股本
-- 營收成長
-- 獲利成長
-- 毛利率
-- 營業利益率
-- 營業現金流
-- CAPEX
-- 合約負債
-
-CB、合作／新客戶、群體性、族群輪動、歷史循環，
-目前沒有可靠資料時不會亂填成「符合」。
-"""
-    )
-
-
-# =========================================================
-# 自選股
-# =========================================================
-
-with tab4:
-
-    st.subheader(
-        "⭐ 自選觀察"
-    )
-
-    watchlist = st.text_area(
-        "輸入股票代號，用逗號分隔，例如：2330,6488,2317"
-    )
+    code = st.text_input(
+        "股票代號，例如 2330",
+        key="single"
+    ).strip()
 
     if st.button(
-        "更新自選股"
-    ):
+        "分析個股"
+    ) and code:
 
-        output = []
-
-        codes = [
-            x.strip()
-            for x in watchlist
-            .replace(
-                "，",
-                ","
-            )
-            .split(",")
-            if x.strip()
+        hit = pool[
+            pool["代號"] == code
         ]
 
-        for code in codes:
+        if hit.empty:
 
-            symbol, market = (
-                resolve_symbol(
-                    code
-                )
+            st.error(
+                "股票池找不到這個代號。"
             )
 
-            if symbol:
+        else:
 
-                prices = price_data(
-                    symbol
+            r = hit.iloc[0]
+
+            d = price_history(
+                r["symbol"]
+            )
+
+            tech = technical(
+                d,
+                6
+            )
+
+            fund = fundamentals(
+                r["symbol"]
+            )
+
+            evs, titles = news_events(
+                fund["新聞"]
+            )
+
+            st.subheader(
+                f"{code} "
+                f"{r['名稱']}｜"
+                f"{r['市場']}｜"
+                f"{r['產業']}"
+            )
+
+            if not d.empty:
+                st.line_chart(
+                    d["Close"]
                 )
 
-                fundamental = fundamentals(
-                    symbol
-                )
+            detail = {
+                "股本億":
+                    r["股本億"],
 
-                if not prices.empty:
+                "市值億":
+                    fund[
+                        "市值億"
+                    ],
 
-                    technical = tech(
-                        prices,
-                        base_months
-                    )
+                **tech,
 
-                    output.append(
-                        {
-                            "代號":
-                                code,
+                "營收成長%":
+                    fund[
+                        "營收成長"
+                    ],
 
-                            "名稱":
-                                fundamental[
-                                    "name"
-                                ],
+                "獲利成長%":
+                    fund[
+                        "獲利成長"
+                    ],
 
-                            "市場":
-                                market,
+                "毛利率%":
+                    fund[
+                        "毛利率"
+                    ],
 
-                            "現價":
-                                round(
-                                    technical[
-                                        "price"
-                                    ],
-                                    2
-                                ),
+                "營益率%":
+                    fund[
+                        "營益率"
+                    ],
 
-                            "2年回落%":
-                                round(
-                                    technical[
-                                        "drawdown"
-                                    ],
-                                    1
-                                ),
+                "CAPEX成長%":
+                    fund[
+                        "CAPEX成長"
+                    ],
 
-                            "營收成長%":
-                                fundamental[
-                                    "rev_growth"
-                                ],
+                "CAPEX/營收%":
+                    fund[
+                        "CAPEX營收比"
+                    ],
 
-                            "獲利成長%":
-                                fundamental[
-                                    "earn_growth"
-                                ],
+                "合約負債成長%":
+                    fund[
+                        "合約負債成長"
+                    ],
 
-                            "CAPEX成長%":
-                                fundamental[
-                                    "capex_growth"
-                                ],
+                "現金流改善":
+                    fund[
+                        "現金流改善"
+                    ],
 
-                            "合約負債成長%":
-                                fundamental[
-                                    "contract_growth"
-                                ]
-                        }
-                    )
+                "存貨變化%":
+                    fund[
+                        "存貨變化"
+                    ],
 
-        if output:
+                "應收變化%":
+                    fund[
+                        "應收變化"
+                    ],
+
+                "事件":
+                    ",".join(evs)
+            }
 
             st.dataframe(
                 pd.DataFrame(
-                    output
+                    detail.items(),
+                    columns=[
+                        "項目",
+                        "數值"
+                    ]
                 ),
                 use_container_width=True,
                 hide_index=True
             )
 
-        else:
+            if titles:
 
-            st.warning(
-                "沒有可顯示的自選股資料"
-            )
+                st.dataframe(
+                    pd.DataFrame({
+                        "近期公開標題":
+                            titles
+                    }),
+                    use_container_width=True,
+                    hide_index=True
+                )
+
+
+with tabs[2]:
+
+    st.subheader(
+        "族群＋CB"
+    )
+
+    st.write(
+        "先看族群同步轉強；"
+        "CB 只提供 MOPS／櫃買中心官方入口核對。"
+        "這版不從 HTML 猜 CB 公司代號，避免誤判。"
+    )
+
+    st.info(
+        "CB 官方資料可查，"
+        "但目前沒有採用我能確認可靠的"
+        "結構化 CB 公司代號 API；"
+        "因此不自動猜、不拿 CB 淘汰股票。"
+    )
+
+    st.link_button(
+        "MOPS－國內轉換公司債",
+        MOPS_CB
+    )
+
+    st.link_button(
+        "櫃買中心－最近上櫃轉(交)換公司債",
+        TPEX_CB
+    )
+
+
+with tabs[3]:
+
+    st.subheader(
+        "資料來源與健康檢查"
+    )
+
+    health = pd.DataFrame(
+        [
+            [
+                "上市公司股票池",
+                "TWSE OpenAPI",
+                (
+                    "正常"
+                    if fetch_json(
+                        TWSE_BASIC
+                    )
+                    else "目前不可讀"
+                )
+            ],
+            [
+                "上櫃公司股票池",
+                "TPEx OpenAPI",
+                (
+                    "正常"
+                    if fetch_json(
+                        TPEX_BASIC
+                    )
+                    else "目前不可讀"
+                )
+            ],
+            [
+                "創新板辨識",
+                "TWSE 最近上市公司",
+                (
+                    "正常"
+                    if innovation_codes()
+                    else "目前未辨識到"
+                )
+            ],
+            [
+                "CB",
+                "MOPS / TPEx 官方頁",
+                "官方頁可查；不做不可靠的自動代號猜測"
+            ],
+            [
+                "歷史價格",
+                "Yahoo Finance",
+                "依個股即時連線"
+            ],
+            [
+                "財務/新聞",
+                "Yahoo Finance",
+                "抓不到即顯示缺資料，不補 0"
+            ],
+        ],
+        columns=[
+            "資料",
+            "來源",
+            "狀態"
+        ]
+    )
+
+    st.dataframe(
+        health,
+        use_container_width=True,
+        hide_index=True
+    )
+
+    st.write(
+        "群體性＝同產業內"
+        "『20日上漲＋量能增加』公司比例；"
+        "族群輪動＝同產業股票20日平均漲跌。"
+    )
+
+    st.write(
+        "CB 自動提示只使用官方公開頁面"
+        "能可靠辨識到的內容；"
+        "無法可靠辨識時不做假判斷。"
+    )
+
+    st.caption(
+        "頁面更新時間："
+        + datetime.now().strftime(
+            "%Y-%m-%d %H:%M:%S"
+        )
+    )
